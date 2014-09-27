@@ -25,20 +25,16 @@ sub collection {
 sub collection_names {
   my ($self, $cb) = @_;
 
-  my $len        = length $self->name;
-  my $collection = $self->collection('system.namespaces');
+  my $command = bson_doc listCollections => undef;
 
   # Non-blocking
-  return $collection->find->all(
-    sub {
-      my ($cursor, $err, $docs) = @_;
-      $self->$cb($err, [map { substr $_->{name}, $len + 1 } @$docs]);
-    }
-  ) if $cb;
+  return $self->command($command => sub {
+    my ($self, $err, $doc) = @_;
+    $self->$cb($err, _extract_names($doc));
+  }) if $cb;
 
   # Blocking
-  my $docs = $collection->find->all;
-  return [map { substr $_->{name}, $len + 1 } @$docs];
+  return _extract_names($self->command($command));
 }
 
 sub command {
@@ -80,6 +76,18 @@ sub dereference {
 sub gridfs { Mango::GridFS->new(db => shift) }
 
 sub stats { shift->command(bson_doc(dbstats => 1), @_) }
+
+
+sub _extract_names {
+  my $doc = shift;
+
+  return undef unless (my $collections = $doc->{collections});
+
+  my @names = grep { $_ ne 'system.indexes' }
+              map { $_->{name} } @$collections;
+
+  return \@names;
+}
 
 1;
 
