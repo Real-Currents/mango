@@ -92,14 +92,16 @@ sub full_name { join '.', $_[0]->db->name, $_[0]->name }
 sub index_information {
   my ($self, $cb) = @_;
 
+  my $command = bson_doc listIndexes => $self->name;
+
   # Non-blocking
-  my $collection = $self->db->collection('system.indexes');
-  my $cursor = $collection->find({ns => $self->full_name})->fields({ns => 0});
-  return $cursor->all(sub { shift; $self->$cb(shift, _indexes(shift)) })
-    if $cb;
+  return $self->db->command($command => sub {
+    my ($self, $err, $doc) = @_;
+    $self->$cb($err, _indexes($doc->{indexes}));
+  }) if $cb;
 
   # Blocking
-  return _indexes($cursor->all);
+  return _indexes($self->db->command($command)->{indexes});
 }
 
 sub insert {
