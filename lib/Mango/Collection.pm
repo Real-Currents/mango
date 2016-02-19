@@ -90,28 +90,31 @@ sub find_one {
 sub full_name { join '.', $_[0]->db->name, $_[0]->name }
 
 sub index_information {
-  my ($self, $cb) = @_;
+  my $self = shift;
+  my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
 
-  # Non-blocking
-  my $collection = $self->db->collection('system.indexes');
-  my $cursor = $collection->find({ns => $self->full_name})->fields({ns => 0});
-  return $cursor->all(sub { shift; $self->$cb(shift, _indexes(shift)) })
-    if $cb;
+  my $cmd = bson_doc(listIndexes => $self->name, @_);
 
-  # Blocking
-  return _indexes($cursor->all);
+  $self->_command($cmd, $cb,
+    sub {
+      my $doc = shift or return bson_doc;
+      bson_doc map { delete $_->{ns}; (delete $_->{name}, $_) }
+        @{$doc->{cursor}->{firstBatch}};
+    }
+  );
 }
 
 sub insert {
-  my ($self, $docs) = @_;
-  $docs = [$docs] unless ref $docs eq 'ARRAY';
-  my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
+  my ($self, $orig_docs, $cb) = @_;
+  $orig_docs = [$orig_docs] unless ref $orig_docs eq 'ARRAY';
 
-  # Make sure all documents have ids
-  my @ids = map { $_->{_id} //= bson_oid } @$docs;
+  # Make a shallow copy of the documents and add an id if needed
+  my @docs = map { { %$_ } } @$orig_docs;
+  my @ids = map { $_->{_id} //= bson_oid } @docs;
+
   my $command = bson_doc
     insert       => $self->name,
-    documents    => $docs,
+    documents    => \@docs,
     ordered      => \1,
     writeConcern => $self->db->build_write_concern;
 
@@ -138,13 +141,8 @@ sub map_reduce {
 sub options {
   my ($self, $cb) = @_;
 
-  # Non-blocking
-  my $query = {name => $self->full_name};
-  my $namespaces = $self->db->collection('system.namespaces');
-  return $namespaces->find_one($query => sub { shift; $self->$cb(@_) }) if $cb;
-
-  # Blocking
-  return $namespaces->find_one($query);
+  my $cmd = bson_doc(listCollections => 1, filter => { name => $self->name });
+  $self->_command($cmd, $cb, sub { shift->{cursor}->{firstBatch}->[0] });
 }
 
 sub remove {
@@ -162,6 +160,28 @@ sub remove {
     writeConcern => $self->db->build_write_concern;
 
   return $self->_command($command, $cb);
+}
+
+sub rename {
+  my ($self, $name, $cb) = @_;
+
+  my $admin = $self->db->mango->db('admin');
+  my $dbname = $self->db->name;
+  my $oldname = join '.', $dbname, $self->name;
+  my $newname = join '.', $dbname, $name;
+
+  my $cmd = bson_doc renameCollection => $oldname, to => $newname;
+
+  # Non-blocking
+  return $admin->command($cmd, sub {
+    my ($admin_db, $err, $doc) = @_;
+    my $newcol = $doc->{ok} ? $self->db->collection($name) : undef;
+    return $cb->($self, $err, $newcol);
+  }) if $cb;
+
+  # Blocking
+  my $doc = $admin->command($cmd);
+  return $doc->{ok} ? $self->db->collection($name) : undef;
 }
 
 sub save {
@@ -237,12 +257,6 @@ sub _command {
   my $doc = $db->command($command);
   if (my $err = $protocol->write_error($doc)) { croak $err }
   return $return->($doc);
-}
-
-sub _indexes {
-  my $indexes = bson_doc;
-  if (my $docs = shift) { $indexes->{delete $_->{name}} = $_ for @$docs }
-  return $indexes;
 }
 
 sub _map_reduce {
@@ -405,8 +419,8 @@ Build L<Mango::Cursor::Query> object for query.
   my $doc = $collection->find_and_modify(
     {query => {foo => 'bar'}, update => {'$set' => {foo => 'baz'}}});
 
-Update document atomically. You can also append a callback to perform
-operation non-blocking.
+Fetch and update or remove a document atomically. You can also append a callback
+to perform operation non-blocking.
 
   my $opts = {query => {foo => 'bar'}, update => {'$set' => {foo => 'baz'}}};
   $collection->find_and_modify($opts => sub {
@@ -414,6 +428,9 @@ operation non-blocking.
     ...
   });
   Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+
+By default this method returns the unmodified version of the document. To
+change this behaviour, add the option C<new =E<gt> 1>.
 
 =head2 find_one
 
@@ -439,6 +456,8 @@ Full name of this collection.
 =head2 index_information
 
   my $info = $collection->index_information;
+  # return only the 5 first indexes
+  my $info = $collection->index_information(cursor => { batchSize => 5 });
 
 Get index information for collection. You can also append a callback to
 perform operation non-blocking.
@@ -462,6 +481,11 @@ to perform operation non-blocking.
     ...
   });
   Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+
+Note that C<insert> has to ensure each document has an C<_id> before sending
+them to MongoDB. To avoid modifying your data, it makes a copy of the
+documents. This can be a bit slow if you are sending big objects like
+pictures. To avoid that, consider using C<save> instead.
 
 =head2 map_reduce
 
@@ -496,13 +520,13 @@ operation non-blocking.
 
 =head2 remove
 
-  my $doc = $collection->remove;
-  my $doc = $collection->remove($oid);
-  my $doc = $collection->remove({foo => 'bar'});
-  my $doc = $collection->remove({foo => 'bar'}, {single => 1});
+  my $result = $collection->remove;
+  my $result = $collection->remove($oid);
+  my $result = $collection->remove({foo => 'bar'});
+  my $result = $collection->remove({foo => 'bar'}, {single => 1});
 
 Remove documents from collection. You can also append a callback to perform
-operation non-blocking.
+operation non-blocking. Returns a WriteResult document.
 
   $collection->remove(({foo => 'bar'}, {single => 1}) => sub {
     my ($collection, $err, $doc) = @_;
@@ -522,12 +546,26 @@ Remove only one document.
 
 =back
 
+=head2 rename
+
+  my $new_collection = $collection->rename('NewName');
+
+Rename a collection, keeping all of its original contents and options. Returns
+a new Mango::Collection object pointing to the renamed collection. You can
+also append a callback to perform operation non-blocking.
+
+  $collection->rename('NewName' => sub {
+    my ($collection, $err, $oid) = @_;
+    ...
+  });
+  Mojo::IOLoop->start unless Mojo::IOLoop->is_running;
+
 =head2 save
 
   my $oid = $collection->save({foo => 'bar'});
 
-Save document to collection. You can also append a callback to perform
-operation non-blocking.
+Save document to collection. The document MUST have an C<_id>. You can also
+append a callback to perform operation non-blocking.
 
   $collection->save({foo => 'bar'} => sub {
     my ($collection, $err, $oid) = @_;
@@ -550,12 +588,12 @@ non-blocking.
 
 =head2 update
 
-  my $doc = $collection->update($oid, {foo => 'baz'});
-  my $doc = $collection->update({foo => 'bar'}, {foo => 'baz'});
-  my $doc = $collection->update({foo => 'bar'}, {foo => 'baz'}, {multi => 1});
+  my $result = $collection->update($oid, {foo => 'baz'});
+  my $result = $collection->update({foo => 'bar'}, {foo => 'baz'});
+  my $result = $collection->update({foo => 'bar'}, {foo => 'baz'}, {multi => 1});
 
 Update document in collection. You can also append a callback to perform
-operation non-blocking.
+operation non-blocking. Returns a WriteResult document.
 
   $collection->update(({foo => 'bar'}, {foo => 'baz'}, {multi => 1}) => sub {
     my ($collection, $err, $doc) = @_;

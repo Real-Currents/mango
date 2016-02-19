@@ -2,18 +2,18 @@ package Mango;
 use Mojo::Base 'Mojo::EventEmitter';
 
 use Carp 'croak';
+use Hash::Util::FieldHash;
 use Mango::BSON 'bson_doc';
 use Mango::Database;
 use Mango::Protocol;
 use Mojo::IOLoop;
 use Mojo::URL;
-use Mojo::Util qw(dumper md5_sum);
+use Mojo::Util 'dumper';
 use Scalar::Util 'weaken';
 
 use constant DEBUG => $ENV{MANGO_DEBUG} || 0;
 use constant DEFAULT_PORT => 27017;
 
-has credentials => sub { [] };
 has default_db  => 'admin';
 has hosts       => sub { [['localhost']] };
 has [qw(inactivity_timeout j)] => 0;
@@ -24,7 +24,11 @@ has [qw(max_write_batch_size wtimeout)] => 1000;
 has protocol => sub { Mango::Protocol->new };
 has w => 1;
 
-our $VERSION = '1.16';
+# Private variables are not visible in the object's dump. This
+# is good for security.
+Hash::Util::FieldHash::fieldhash my %AUTH;
+
+our $VERSION = '1.25';
 
 sub DESTROY { shift->_cleanup }
 
@@ -57,8 +61,11 @@ sub from_string {
   if (my $db = $url->path->parts->[0]) { $self->default_db($db) }
 
   # User and password
-  push @{$self->credentials}, [$self->default_db, $1, $2]
-    if ($url->userinfo // '') =~ /^([^:]+):([^:]+)$/;
+  if (($url->userinfo // '') =~ /^([^:]+):([^:]+)$/) {
+    require Mango::Auth::SCRAM;
+    $self->_auth(Mango::Auth::SCRAM->new)
+      ->_auth->_credentials([$self->default_db, $1, $2]);
+  }
 
   # Options
   my $query = $url->query;
@@ -78,15 +85,13 @@ sub new { shift->SUPER::new->from_string(@_) }
 sub query { shift->_op('query', 1, @_) }
 
 sub _auth {
-  my ($self, $id) = @_;
+  my ($self, $mode) = @_;
+  return $AUTH{$self} unless $mode;
 
-  # No more authentication (connection is ready)
-  return $self->emit(connection => $id)->_next
-    unless my $auth = shift @{$self->{connections}{$id}{credentials}};
-
-  # Run "getnonce" command followed by "authenticate"
-  my $cb = sub { shift->_nonce($id, $auth, @_) };
-  $self->_fast($id, $auth->[0], {getnonce => 1}, $cb);
+  $AUTH{$self} = $mode;
+  $AUTH{$self}->mango($self);
+  weaken $AUTH{$self}->{mango};
+  return $self;
 }
 
 sub _build {
@@ -104,7 +109,10 @@ sub _cleanup {
   # Clean up connections
   delete $self->{pid};
   my $connections = delete $self->{connections};
-  $self->_loop($connections->{$_}{nb})->remove($_) for keys %$connections;
+  for my $c (keys %$connections) {
+    my $loop = $self->_loop($connections->{$c}{nb});
+    $loop->remove($c) if $loop;
+  }
 
   # Clean up active operations
   my $queue = delete $self->{queue} || [];
@@ -150,8 +158,7 @@ sub _connect {
       $self->_fast($id, $self->default_db, {isMaster => 1}, $cb);
     }
   );
-  $self->{connections}{$id}
-    = {credentials => [@{$self->credentials}], nb => $nb, start => 1};
+  $self->{connections}{$id} = { nb => $nb, start => 1 };
 
   my $num = scalar keys %{$self->{connections}};
   warn "-- New connection ($host:$port:$num)\n" if DEBUG;
@@ -203,11 +210,15 @@ sub _master {
   my ($self, $id, $nb, $hosts, $doc) = @_;
 
   # Check version
-  return $self->_error($id, 'MongoDB version 2.6 required')
-    unless ($doc->{maxWireVersion} || 0) >= 2;
+  return $self->_error($id, 'MongoDB version 3.0 required')
+    unless ($doc->{maxWireVersion} || 0) >= 3;
 
   # Continue with authentication if we are connected to the primary
-  return $self->_auth($id) if $doc->{ismaster};
+  if ($doc->{ismaster}) {
+    return $self->_auth
+      ? $self->_auth->_authenticate($id)
+      : $self->emit(connection => $id)->_next;
+  }
 
   # Get primary and try to connect again
   unshift @$hosts, [$1, $2] if ($doc->{primary} // '') =~ /^(.+):(\d+)$/;
@@ -234,18 +245,6 @@ sub _next {
   # Check if we need more non-blocking connections
   $self->_connect(1)
     if !$start && @{$self->{queue}} && @ids < $self->max_connections;
-}
-
-sub _nonce {
-  my ($self, $id, $auth, $err, $doc) = @_;
-
-  # Run "authenticate" command with "nonce" value
-  my $nonce = $doc->{nonce} // '';
-  my ($db, $user, $pass) = @$auth;
-  my $key = md5_sum $nonce . $user . md5_sum "$user:mongo:$pass";
-  my $command
-    = bson_doc(authenticate => 1, user => $user, nonce => $nonce, key => $key);
-  $self->_fast($id, $db, $command, sub { shift->_auth($id) });
 }
 
 sub _op {
@@ -381,9 +380,13 @@ with the L<Mojolicious> real-time web framework, and with multiple event loop
 support. Since MongoDB is still changing rapidly, only the latest stable
 version is supported.
 
+For MongoDB 2.6 support, use L<Mango> 1.16.
+
 To learn more about MongoDB you should take a look at the
 L<official documentation|http://docs.mongodb.org>, the documentation included
 in this distribution is no replacement for it.
+
+Look at L<Mango::Collection> for CRUD operations.
 
 Many arguments passed to methods as well as values of attributes get
 serialized to BSON with L<Mango::BSON>, which provides many helper functions
@@ -415,13 +418,6 @@ Emitted when a new connection has been established.
 =head1 ATTRIBUTES
 
 L<Mango> implements the following attributes.
-
-=head2 credentials
-
-  my $credentials = $mango->credentials;
-  $mango          = $mango->credentials([['test', 'sri', 's3cret']]);
-
-Authentication credentials that will be used on every reconnect.
 
 =head2 default_db
 
@@ -567,6 +563,10 @@ perform operation non-blocking.
 Construct a new L<Mango> object and parse connection string with
 L</"from_string"> if necessary.
 
+If a username and password are provided, Mango will try to authenticate using
+SCRAM-SHA1. B<Warning:> this will require L<Authen::SCRAM> which is not
+installed by default.
+
 =head2 query
 
   my $reply
@@ -605,6 +605,8 @@ In alphabetical order:
 
 =over 2
 
+alexbyk
+
 Andrey Khozov
 
 Colin Cyr
@@ -620,7 +622,7 @@ the terms of the Artistic License version 2.0.
 
 =head1 SEE ALSO
 
-L<https://github.com/odc/mango>, L<Mojolicious::Guides>,
+L<https://github.com/oliwer/mango>, L<Mojolicious::Guides>,
 L<http://mojolicio.us>.
 
 =cut

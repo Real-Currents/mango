@@ -29,11 +29,17 @@ is $collection->build_index_name(bson_doc(foo => 1, bar => -1, baz => '2d')),
   'foo_bar_baz', 'right index name';
 
 # Insert documents blocking
-my $oids = $collection->insert([{foo => 'bar'}, {foo => 'baz'}]);
+my $doc1 = { foo => 'bar' };
+my $doc2 = { foo => 'baz' };
+my $oids = $collection->insert([$doc1, $doc2]);
 isa_ok $oids->[0], 'Mango::BSON::ObjectID', 'right class';
 isa_ok $oids->[1], 'Mango::BSON::ObjectID', 'right class';
 is $collection->find_one($oids->[0])->{foo}, 'bar', 'right value';
 is $collection->find_one($oids->[1])->{foo}, 'baz', 'right value';
+
+# Make sure the documents are not modified after insertion
+is $doc1->{_id}, undef, 'document not modified';
+is $doc2->{_id}, undef, 'document not modified';
 
 # Get collection statistics blocking
 is $collection->stats->{count}, 2, 'right number of documents';
@@ -51,6 +57,19 @@ $collection->stats(
 Mojo::IOLoop->start;
 ok !$fail, 'no error';
 is $result->{count}, 2, 'right number of documents';
+
+# Rename the collection
+ok $collection = $collection->rename('renamed'), 'collection renamed';
+$collection->rename('collection_test' => sub {
+  my ($orig_collection, $err, $new_collection) = @_;
+  $fail = $err;
+  $result = $new_collection;
+  Mojo::IOLoop->stop;
+});
+Mojo::IOLoop->start;
+ok !$fail, 'no error';
+is $result->name, 'collection_test', 'collection renamed non-blocking';
+$collection = $result;
 
 # Update documents blocking
 is $collection->update({}, {'$set' => {bar => 'works'}}, {multi => 1})->{n},
@@ -110,7 +129,7 @@ is $collection->find_one($oid)->{atomic}, 2, 'right document';
 is $collection->remove({atomic => 2})->{n}, 1, 'removed one document';
 
 # Get options blocking
-is $collection->options->{name}, $collection->full_name, 'right name';
+is $collection->options->{name}, $collection->name, 'right name';
 
 # Get options non-blocking
 ($fail, $result) = ();
@@ -124,7 +143,7 @@ $collection->options(
 );
 Mojo::IOLoop->start;
 ok !$fail, 'no error';
-is $result->{name}, $collection->full_name, 'right name';
+is $result->{name}, $collection->name, 'right name';
 
 # Get options blocking (missing collection)
 is $mango->db->collection('collection_test2')->options, undef,
@@ -535,7 +554,7 @@ $mango->db->collection('collection_test')->remove(
 );
 Mojo::IOLoop->start;
 Mojo::IOLoop->remove($id);
-like $fail, qr/Premature connection close/, 'right error';
+like $fail, qr/timeout|Premature/, 'right error';
 ok !$result->{n}, 'remove was not successful';
 
 done_testing();
